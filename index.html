@@ -7173,6 +7173,7 @@ NOL3.pages.riders = function (root) {
           if (typeof NOL3.saveUploadedData === "function") {
             NOL3.saveUploadedData("riders", [file]);
           }
+          window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders" } }));
         });
       }
     });
@@ -8238,7 +8239,8 @@ NOL3.pages.riders = function (root) {
         const unifiedStatus = document.getElementById('unifiedInventoryStatus');
         if (unifiedSummary) unifiedSummary.textContent = unifiedName;
         if (unifiedStatus && !unifiedStatus.textContent.trim()) unifiedStatus.textContent = `${((NOL3.lmInventory?.rows?.length || 0) + (NOL3.incomingInventory?.rows?.length || 0)).toLocaleString()} records loaded`;
-        if (unifiedInventoryClearBtn) unifiedInventoryClearBtn.disabled = false;
+        const clearBtnEl = document.getElementById("clearUnifiedInventoryBtn");
+        if (clearBtnEl) clearBtnEl.disabled = false;
       }
     } catch (error) {
       console.warn("NOL3: Could not update saved upload summaries.", error);
@@ -8590,25 +8592,100 @@ NOL3.pages.riders = function (root) {
  */
 (function () {
   const SUPABASE_URL = "https://uduaxxwzpxwytekejito.supabase.co";
-  const SUPABASE_KEY_STORAGE = "NOL3_SUPABASE_PUBLISHABLE_KEY";
   const HUB_ID = 3;
   const HUB_NAME = "Badoc Hub";
   const HUB_CODE = "BADOC";
-  const DATA_TYPE = "app_state";
-  const POLL_MS = 5000;
-  const PUSH_DEBOUNCE_MS = 1200;
   const DB_NAME = "NOL3_Planning_Dashboard_DB";
   const DB_VERSION = 2;
   const STORE = "uploadedFiles";
 
-  let lastLocalHash = "";
-  let lastRemoteUpdatedAt = 0;
-  let lastLocalMutationAt = 0;
-  let pushTimer = null;
-  let syncing = false;
+  // Three independent sync "channels", all sharing the same hub_data table
+  // (distinguished by data_type) but on different cadences/behavior:
+  //  - settings: tiny config (business date, hours, zone settings, planning
+  //    layout/town groups). Fast cadence. Never auto-cleared.
+  //  - roster: the riders file only. Small, persistent reference data. Fast
+  //    cadence. Never auto-cleared.
+  //  - files: the bulky day-to-day operational uploads (LM/incoming/linehaul
+  //    inventory, the unified-inventory snapshot and its undo copy). Large,
+  //    ephemeral. Slow cadence, and the ONLY data_type a cleanup job should
+  //    ever delete (see the pg_cron script — it targets data_type =
+  //    'app_state_files' specifically so it can never touch the other two).
   let applyingRemote = false;
-  let initialized = false;
   const META_KEY = "NOL3_CLOUD_LAST_APPLIED_BADOC";
+
+  function makeChannel(config) {
+    return {
+      ...config,
+      lastHash: "",
+      lastRemoteUpdatedAt: 0,
+      lastLocalMutationAt: 0,
+      pushTimer: null,
+      syncing: false,
+      initialized: false
+    };
+  }
+
+  const settingsChannel = makeChannel({
+    dataType: "app_state",
+    metaKey: META_KEY,
+    pollMs: 5000,
+    debounceMs: 1200,
+    async buildSnapshot() {
+      return {
+        version: 1,
+        hubId: HUB_ID,
+        hubName: HUB_NAME,
+        hubCode: HUB_CODE,
+        clientUpdatedAt: settingsChannel.lastLocalMutationAt || Number(localStorage.getItem(META_KEY) || 0),
+        localState: getHubState()
+      };
+    },
+    async applyRemote(data) {
+      applyHubState(data.localState);
+    }
+  });
+
+  const rosterChannel = makeChannel({
+    dataType: "app_state_roster",
+    metaKey: "NOL3_CLOUD_LAST_APPLIED_BADOC_ROSTER",
+    pollMs: 5000,
+    debounceMs: 1200,
+    async buildSnapshot() {
+      const all = await readIndexedDB();
+      return {
+        version: 1,
+        hubId: HUB_ID,
+        hubName: HUB_NAME,
+        hubCode: HUB_CODE,
+        clientUpdatedAt: rosterChannel.lastLocalMutationAt || Number(localStorage.getItem(rosterChannel.metaKey) || 0),
+        indexedDB: all.filter(record => record && record.type === "riders")
+      };
+    },
+    async applyRemote(data) {
+      await restoreIndexedDB(data.indexedDB);
+    }
+  });
+
+  const filesChannel = makeChannel({
+    dataType: "app_state_files",
+    metaKey: "NOL3_CLOUD_LAST_APPLIED_BADOC_FILES",
+    pollMs: 60000,
+    debounceMs: 8000,
+    async buildSnapshot() {
+      const all = await readIndexedDB();
+      return {
+        version: 1,
+        hubId: HUB_ID,
+        hubName: HUB_NAME,
+        hubCode: HUB_CODE,
+        clientUpdatedAt: filesChannel.lastLocalMutationAt || Number(localStorage.getItem(filesChannel.metaKey) || 0),
+        indexedDB: all.filter(record => !(record && record.type === "riders"))
+      };
+    },
+    async applyRemote(data) {
+      await restoreIndexedDB(data.indexedDB);
+    }
+  });
 
   const status = (text, good = null) => {
     let el = document.getElementById("nol3CloudStatus");
@@ -8622,10 +8699,14 @@ NOL3.pages.riders = function (root) {
     el.style.opacity = good === null ? ".92" : good ? "1" : ".78";
   };
 
-  const getSupabaseKey = () => {
-    try { return String(localStorage.getItem(SUPABASE_KEY_STORAGE) || "").trim(); }
-    catch (_) { return ""; }
-  };
+  // Hardcoded so this device (and every future copy of this file) connects
+  // automatically with no key-entry prompt. This is a Supabase *publishable*
+  // key, which is safe to ship in client-side code by design (unlike a
+  // secret/service_role key) — it's the same key that was previously typed
+  // into the connect modal, just no longer requested at runtime.
+  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_mECx0rqIkWPy_QjPqNIVrw_z3Mv9H_R";
+
+  const getSupabaseKey = () => SUPABASE_PUBLISHABLE_KEY;
   const configured = () => SUPABASE_URL.startsWith("https://") && !!getSupabaseKey();
 
   const api = async (path, options = {}) => {
@@ -8740,24 +8821,12 @@ NOL3.pages.riders = function (root) {
     }
   }
 
-  async function makeSnapshot() {
-    return {
-      version: 1,
-      hubId: HUB_ID,
-      hubName: HUB_NAME,
-      hubCode: HUB_CODE,
-      clientUpdatedAt: lastLocalMutationAt || Number(localStorage.getItem(META_KEY) || 0),
-      localState: getHubState(),
-      indexedDB: await readIndexedDB()
-    };
-  }
-
   function stableHash(value) {
     try { return JSON.stringify(value); } catch (_) { return String(Date.now()); }
   }
 
-  async function readRemote() {
-    const rows = await api(`hub_data?hub_id=eq.${HUB_ID}&data_type=eq.${encodeURIComponent(DATA_TYPE)}&select=data,updated_at&limit=1`);
+  async function readRemoteFor(channel) {
+    const rows = await api(`hub_data?hub_id=eq.${HUB_ID}&data_type=eq.${encodeURIComponent(channel.dataType)}&select=data,updated_at&limit=1`);
     return Array.isArray(rows) && rows.length ? rows[0] : null;
   }
 
@@ -8778,10 +8847,10 @@ NOL3.pages.riders = function (root) {
     return value;
   }
 
-  async function pushSnapshot(snapshot) {
+  async function pushSnapshotFor(channel, snapshot) {
     const payload = {
       hub_id: HUB_ID,
-      data_type: DATA_TYPE,
+      data_type: channel.dataType,
       data: stripNulCharacters(snapshot),
       updated_at: new Date().toISOString()
     };
@@ -8799,170 +8868,137 @@ NOL3.pages.riders = function (root) {
     }
   }
 
-  function showKeyModal(force = false) {
-    return new Promise((resolve) => {
-      try {
-        const existing = getSupabaseKey();
-        if (!force && existing) { resolve(existing); return; }
+  async function initialSyncChannel(channel) {
+    const remote = await readRemoteFor(channel);
+    const local = await channel.buildSnapshot();
+    const savedRemoteTime = Number(localStorage.getItem(channel.metaKey) || 0);
 
-        const old = document.getElementById("nol3SupabaseKeyModal");
-        if (old) old.remove();
+    if (!remote || !remote.data) {
+      local.clientUpdatedAt = Date.now();
+      channel.lastLocalMutationAt = local.clientUpdatedAt;
+      await pushSnapshotFor(channel, local);
+      localStorage.setItem(channel.metaKey, String(local.clientUpdatedAt));
+      channel.lastRemoteUpdatedAt = local.clientUpdatedAt;
+      channel.lastHash = stableHash(await channel.buildSnapshot());
+      channel.initialized = true;
+      return false;
+    }
 
-        const wrap = document.createElement("div");
-        wrap.id = "nol3SupabaseKeyModal";
-        wrap.style.cssText = "position:fixed;inset:0;z-index:100000;background:rgba(15,23,42,.58);display:flex;align-items:center;justify-content:center;padding:20px;font-family:Arial,sans-serif";
-        wrap.innerHTML = `
-          <div style="width:min(520px,100%);background:#fff;border-radius:16px;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.3)">
-            <div style="font-size:18px;font-weight:700;color:#111827;margin-bottom:8px">NOL3 Badoc Cloud Sync</div>
-            <div style="font-size:13px;line-height:1.5;color:#4b5563;margin-bottom:14px">Enter your Supabase <b>publishable key</b>. It starts with <b>sb_publishable_</b>. Do not enter the secret/service-role key.</div>
-            <input id="nol3SupabaseKeyInput" type="text" autocomplete="off" spellcheck="false" placeholder="sb_publishable_..." style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:10px;font-size:13px;outline:none">
-            <div id="nol3SupabaseKeyError" style="display:none;margin-top:9px;color:#b91c1c;font-size:12px"></div>
-            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
-              <button id="nol3SupabaseKeyCancel" type="button" style="padding:10px 14px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;cursor:pointer">Cancel</button>
-              <button id="nol3SupabaseKeySave" type="button" style="padding:10px 16px;border:0;border-radius:9px;background:#111827;color:#fff;font-weight:700;cursor:pointer">Connect</button>
-            </div>
-          </div>`;
-        document.body.appendChild(wrap);
-        const input = document.getElementById("nol3SupabaseKeyInput");
-        const err = document.getElementById("nol3SupabaseKeyError");
-        const close = (value) => { wrap.remove(); resolve(value || ""); };
-        document.getElementById("nol3SupabaseKeyCancel").onclick = () => close(existing);
-        document.getElementById("nol3SupabaseKeySave").onclick = () => {
-          const key = String(input.value || "").trim();
-          if (!key) { err.textContent = "Please enter the publishable key."; err.style.display = "block"; return; }
-          if (!key.startsWith("sb_publishable_")) { err.textContent = "This does not look like a Supabase publishable key. It should start with sb_publishable_."; err.style.display = "block"; return; }
-          localStorage.setItem(SUPABASE_KEY_STORAGE, key);
-          close(key);
-        };
-        input.addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("nol3SupabaseKeySave").click(); });
-        setTimeout(() => input.focus(), 50);
-      } catch (_) { resolve(getSupabaseKey()); }
-    });
+    const remoteSnapshot = remote.data;
+    const remoteTime = Number(remoteSnapshot?.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
+    const localTime = Math.max(savedRemoteTime, channel.lastLocalMutationAt || 0);
+
+    if (remoteTime > localTime) {
+      await channel.applyRemote(remoteSnapshot);
+      channel.lastRemoteUpdatedAt = remoteTime;
+      channel.lastLocalMutationAt = remoteTime;
+      localStorage.setItem(channel.metaKey, String(remoteTime));
+      channel.lastHash = stableHash(await channel.buildSnapshot());
+      channel.initialized = true;
+      return true;
+    }
+
+    // The browser already has the same cloud version. Keep local data and
+    // push it only when it differs from the cloud snapshot.
+    channel.lastRemoteUpdatedAt = remoteTime;
+    channel.lastLocalMutationAt = localTime;
+    const localNow = await channel.buildSnapshot();
+    if (stableHash(localNow) !== stableHash(remoteSnapshot)) {
+      localNow.clientUpdatedAt = Math.max(localTime, remoteTime, Date.now());
+      channel.lastLocalMutationAt = localNow.clientUpdatedAt;
+      await pushSnapshotFor(channel, localNow);
+      localStorage.setItem(channel.metaKey, String(localNow.clientUpdatedAt));
+      channel.lastRemoteUpdatedAt = localNow.clientUpdatedAt;
+    }
+    channel.lastHash = stableHash(await channel.buildSnapshot());
+    channel.initialized = true;
+    return false;
   }
 
   async function initialSync() {
-    // This repair build deliberately ignores any old saved key once, so the
-    // user gets a visible key-entry screen instead of a browser prompt.
-    const keyResetFlag = "NOL3_BADOC_KEY_UI_V1";
-    if (!localStorage.getItem(keyResetFlag)) {
-      try { localStorage.removeItem(SUPABASE_KEY_STORAGE); localStorage.setItem(keyResetFlag, "1"); } catch (_) {}
-      await showKeyModal(true);
-    } else if (!configured()) {
-      await showKeyModal(false);
-    }
-    if (!configured()) {
-      status("ADD KEY TO CONNECT", false);
-      return;
-    }
     status("CONNECTING…");
     try {
-      const remote = await readRemote();
-      const local = await makeSnapshot();
-      const savedRemoteTime = Number(localStorage.getItem(META_KEY) || 0);
-
-      if (!remote || !remote.data) {
-        local.clientUpdatedAt = Date.now();
-        lastLocalMutationAt = local.clientUpdatedAt;
-        await pushSnapshot(local);
-        localStorage.setItem(META_KEY, String(local.clientUpdatedAt));
-        lastRemoteUpdatedAt = local.clientUpdatedAt;
-        lastLocalHash = stableHash(await makeSnapshot());
-        status("CONNECTED • LOCAL UPLOADED", true);
-        initialized = true;
-        return;
-      }
-
-      const remoteSnapshot = remote.data;
-      const remoteTime = Number(remoteSnapshot?.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
-      const localTime = Math.max(savedRemoteTime, lastLocalMutationAt || 0);
-
-      if (remoteTime > localTime) {
-        applyHubState(remoteSnapshot.localState);
-        await restoreIndexedDB(remoteSnapshot.indexedDB);
-        lastRemoteUpdatedAt = remoteTime;
-        lastLocalMutationAt = remoteTime;
-        localStorage.setItem(META_KEY, String(remoteTime));
-        lastLocalHash = stableHash(await makeSnapshot());
-        status("CONNECTED • CLOUD LOADED", true);
-        initialized = true;
-        setTimeout(() => location.reload(), 250);
-        return;
-      }
-
-      // The browser already has the same cloud version. Keep local data and
-      // push it only when it differs from the cloud snapshot.
-      lastRemoteUpdatedAt = remoteTime;
-      lastLocalMutationAt = localTime;
-      const localNow = await makeSnapshot();
-      if (stableHash(localNow) !== stableHash(remoteSnapshot)) {
-        localNow.clientUpdatedAt = Math.max(localTime, remoteTime, Date.now());
-        lastLocalMutationAt = localNow.clientUpdatedAt;
-        await pushSnapshot(localNow);
-        localStorage.setItem(META_KEY, String(localNow.clientUpdatedAt));
-        lastRemoteUpdatedAt = localNow.clientUpdatedAt;
-      }
-      lastLocalHash = stableHash(await makeSnapshot());
+      const settingsReloaded = await initialSyncChannel(settingsChannel);
+      const rosterReloaded = await initialSyncChannel(rosterChannel);
+      const filesReloaded = await initialSyncChannel(filesChannel);
       status("CONNECTED • SYNCED", true);
-      initialized = true;
+      if (settingsReloaded || rosterReloaded || filesReloaded) {
+        setTimeout(() => location.reload(), 250);
+      }
     } catch (error) {
       console.error("NOL3 cloud initial sync failed:", error);
       const message = String(error?.message || error || "");
       if (/^(400|401|403):/.test(message)) {
-        try { localStorage.removeItem(SUPABASE_KEY_STORAGE); } catch (_) {}
-        status("KEY/REQUEST ERROR • ENTER KEY AGAIN", false);
-        setTimeout(async () => {
-          const key = await showKeyModal(true);
-          if (key) initialSync();
-        }, 50);
+        status("KEY REJECTED BY SUPABASE • CHECK KEY", false);
         return;
       }
       status("ERROR • CHECK SUPABASE", false);
     }
   }
 
-  async function syncOnce() {
-    if (!initialized || syncing || !configured() || applyingRemote) return;
-    syncing = true;
+  async function syncChannelOnce(channel) {
+    if (!channel.initialized || channel.syncing || !configured() || applyingRemote) return false;
+    channel.syncing = true;
     try {
-      const local = await makeSnapshot();
+      const local = await channel.buildSnapshot();
       const currentHash = stableHash(local);
-      if (currentHash !== lastLocalHash) {
-        lastLocalMutationAt = Date.now();
-        local.clientUpdatedAt = lastLocalMutationAt;
-        await pushSnapshot(local);
-        lastLocalHash = stableHash(await makeSnapshot());
-        lastRemoteUpdatedAt = lastLocalMutationAt;
-        localStorage.setItem(META_KEY, String(lastLocalMutationAt));
-        status("SYNCED • JUST UPDATED", true);
+      if (currentHash !== channel.lastHash) {
+        channel.lastLocalMutationAt = Date.now();
+        local.clientUpdatedAt = channel.lastLocalMutationAt;
+        await pushSnapshotFor(channel, local);
+        channel.lastHash = stableHash(await channel.buildSnapshot());
+        channel.lastRemoteUpdatedAt = channel.lastLocalMutationAt;
+        localStorage.setItem(channel.metaKey, String(channel.lastLocalMutationAt));
       }
 
-      const remote = await readRemote();
+      const remote = await readRemoteFor(channel);
       if (remote?.data) {
         const remoteTime = Number(remote.data.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
-        if (remoteTime > lastRemoteUpdatedAt && remoteTime > lastLocalMutationAt) {
-          applyHubState(remote.data.localState);
-          await restoreIndexedDB(remote.data.indexedDB);
-          lastRemoteUpdatedAt = remoteTime;
-          lastLocalMutationAt = remoteTime;
-          localStorage.setItem(META_KEY, String(remoteTime));
-          lastLocalHash = stableHash(await makeSnapshot());
-          status("SYNCED • CLOUD UPDATE", true);
-          setTimeout(() => location.reload(), 250);
-          return;
+        if (remoteTime > channel.lastRemoteUpdatedAt && remoteTime > channel.lastLocalMutationAt) {
+          await channel.applyRemote(remote.data);
+          channel.lastRemoteUpdatedAt = remoteTime;
+          channel.lastLocalMutationAt = remoteTime;
+          localStorage.setItem(channel.metaKey, String(remoteTime));
+          channel.lastHash = stableHash(await channel.buildSnapshot());
+          return true;
         }
       }
-      if (!currentHash || currentHash === lastLocalHash) status("CONNECTED • LIVE", true);
-    } catch (error) {
-      console.error("NOL3 cloud sync failed:", error);
-      status("OFFLINE • RETRYING", false);
+      return false;
     } finally {
-      syncing = false;
+      channel.syncing = false;
     }
   }
 
-  function schedulePushCheck() {
-    clearTimeout(pushTimer);
-    pushTimer = setTimeout(() => syncOnce(), PUSH_DEBOUNCE_MS);
+  async function syncSettingsAndRoster() {
+    try {
+      const a = await syncChannelOnce(settingsChannel);
+      const b = await syncChannelOnce(rosterChannel);
+      status(a || b ? "SYNCED • CLOUD UPDATE" : "CONNECTED • LIVE", true);
+      if (a || b) setTimeout(() => location.reload(), 250);
+    } catch (error) {
+      console.error("NOL3 cloud sync failed:", error);
+      status("OFFLINE • RETRYING", false);
+    }
+  }
+
+  async function syncFiles() {
+    try {
+      const reload = await syncChannelOnce(filesChannel);
+      if (reload) setTimeout(() => location.reload(), 250);
+    } catch (error) {
+      console.error("NOL3 cloud file sync failed:", error);
+    }
+  }
+
+  // Kept for any code elsewhere that calls window.NOL3CloudSync.syncNow().
+  async function syncOnce() {
+    await syncSettingsAndRoster();
+    await syncFiles();
+  }
+
+  function schedulePushCheck(channel, runner) {
+    clearTimeout(channel.pushTimer);
+    channel.pushTimer = setTimeout(() => runner(), channel.debounceMs);
   }
 
   window.NOL3CloudSync = {
@@ -8992,18 +9028,28 @@ NOL3.pages.riders = function (root) {
         if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state.currentPage || "dashboard");
       } catch (e) { console.warn("NOL3: Could not lock Badoc hub UI", e); }
 
-      initialSync();
-      setInterval(syncOnce, POLL_MS);
+      initialSync().then(() => {
+        setInterval(syncSettingsAndRoster, settingsChannel.pollMs);
+        setInterval(syncFiles, filesChannel.pollMs);
+      });
     }, 1200);
   });
 
   // Catch changes that use the existing storage adapter. IndexedDB changes are
-  // also detected by the periodic snapshot hash.
-  window.addEventListener("hubchange", schedulePushCheck);
-  window.addEventListener("inventoryloaded", schedulePushCheck);
-  window.addEventListener("inventorycleared", schedulePushCheck);
-  window.addEventListener("planningchanged", schedulePushCheck);
-  window.addEventListener("zonechanged", schedulePushCheck);
+  // also detected by each channel's own periodic snapshot hash, but scheduling
+  // an immediate check here makes edits show up on other devices without
+  // waiting for the next poll.
+  window.addEventListener("hubchange", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
+  window.addEventListener("planningchanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
+  window.addEventListener("zonechanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
+  window.addEventListener("inventoryloaded", (event) => {
+    if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
+    else schedulePushCheck(filesChannel, syncFiles);
+  });
+  window.addEventListener("inventorycleared", (event) => {
+    if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
+    else schedulePushCheck(filesChannel, syncFiles);
+  });
 })();
 </script>
 
