@@ -8251,7 +8251,11 @@ NOL3.pages.riders = function (root) {
     const reader = new FileReader();
 
     reader.onload = function (event) {
-      const text = String(event.target.result || "");
+      // Strip NUL (\u0000) characters: they can end up here if a binary file
+      // (e.g. a mis-saved .xlsx) gets read as text, and Postgres/Supabase's
+      // jsonb columns reject \u0000 outright ("unsupported Unicode escape
+      // sequence"), which breaks cloud sync for the whole snapshot.
+      const text = String(event.target.result || "").replace(/\u0000/g, "");
       const rows = text.split(/\r?\n/).filter(row => row.trim() !== "");
       callback({
         fileName: file.name,
@@ -8553,7 +8557,25 @@ NOL3.pages.riders = function (root) {
 })();
 </script>
 <script id="zone-settings-area-input-guard">
-(function(){\n  function guard(){\n    var town=document.getElementById('zoneSettingsTown'), input=document.getElementById('zoneSettingsAreaName');\n    if(!town||!input||input.dataset.guardBound==='1') return;\n    input.dataset.guardBound='1';\n    function sync(){\n      var ok=String(town.value||'').trim()!=='' && town.value!=='No towns available';\n      input.disabled=!ok;\n      if(!ok) input.value='';\n      input.placeholder=ok?'e.g. Nagbacalan Area 1':'Select a town first';\n    }\n    ['focus','keydown','beforeinput','input'].forEach(ev=>input.addEventListener(ev,function(e){\n      if(input.disabled || !(String(town.value||'').trim())){e.preventDefault();e.stopPropagation();sync();}\n    },true));\n    town.addEventListener('change',sync); sync();\n  }\n  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',guard); else guard();\n  new MutationObserver(guard).observe(document.documentElement,{subtree:true,childList:true});\n})();
+(function(){
+  function guard(){
+    var town=document.getElementById('zoneSettingsTown'), input=document.getElementById('zoneSettingsAreaName');
+    if(!town||!input||input.dataset.guardBound==='1') return;
+    input.dataset.guardBound='1';
+    function sync(){
+      var ok=String(town.value||'').trim()!=='' && town.value!=='No towns available';
+      input.disabled=!ok;
+      if(!ok) input.value='';
+      input.placeholder=ok?'e.g. Nagbacalan Area 1':'Select a town first';
+    }
+    ['focus','keydown','beforeinput','input'].forEach(ev=>input.addEventListener(ev,function(e){
+      if(input.disabled || !(String(town.value||'').trim())){e.preventDefault();e.stopPropagation();sync();}
+    },true));
+    town.addEventListener('change',sync); sync();
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',guard); else guard();
+  new MutationObserver(guard).observe(document.documentElement,{subtree:true,childList:true});
+})();
 </script>
 
 
@@ -8567,7 +8589,7 @@ NOL3.pages.riders = function (root) {
  * Do not put a secret/service_role key here.
  */
 (function () {
-  const SUPABASE_URL = "https://uduaxwxzpxwytekejito.supabase.co";
+  const SUPABASE_URL = "https://uduaxxwzpxwytekejito.supabase.co";
   const SUPABASE_KEY_STORAGE = "NOL3_SUPABASE_PUBLISHABLE_KEY";
   const HUB_ID = 3;
   const HUB_NAME = "Badoc Hub";
@@ -8739,11 +8761,28 @@ NOL3.pages.riders = function (root) {
     return Array.isArray(rows) && rows.length ? rows[0] : null;
   }
 
+  // Postgres/Supabase's jsonb columns reject the \u0000 (NUL) escape sequence
+  // outright ("unsupported Unicode escape sequence", code 22P05). If any
+  // stored data (e.g. a file read as text before the NUL-stripping fix, or
+  // anything else) still contains a literal NUL character, JSON.stringify
+  // will emit \u0000 for it and Supabase will reject the whole push. Strip
+  // NULs recursively right before sending as a defensive backstop.
+  function stripNulCharacters(value) {
+    if (typeof value === "string") return value.replace(/\u0000/g, "");
+    if (Array.isArray(value)) return value.map(stripNulCharacters);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const key of Object.keys(value)) out[key] = stripNulCharacters(value[key]);
+      return out;
+    }
+    return value;
+  }
+
   async function pushSnapshot(snapshot) {
     const payload = {
       hub_id: HUB_ID,
       data_type: DATA_TYPE,
-      data: snapshot,
+      data: stripNulCharacters(snapshot),
       updated_at: new Date().toISOString()
     };
     await api(`hub_data?on_conflict=hub_id,data_type`, {
