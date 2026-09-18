@@ -3829,6 +3829,30 @@ NOL3.pages.planning = function (root) {
       try { NOL3Storage.set(BUSINESS_DAY_SETTINGS_KEY, JSON.stringify(settings || {})); } catch (_) {}
     };
 
+    // Today's Volume freeze-at-COT: once LH COT passes for a business date, the
+    // computed volume is captured once and reused from then on for that date,
+    // regardless of later LM Inventory uploads. Keyed per hub + business date so
+    // it resets automatically the moment the business date changes.
+    const FROZEN_TODAY_VOLUME_KEY = "nol3_frozen_today_volume_v1";
+    const loadFrozenTodayVolumeStore = () => {
+      try {
+        const raw = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || "{}");
+        return raw && typeof raw === "object" ? raw : {};
+      } catch (_) { return {}; }
+    };
+    const saveFrozenTodayVolumeStore = (store) => {
+      try { NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(store || {})); } catch (_) {}
+    };
+    const getFrozenTodayVolume = (hub) => {
+      const store = loadFrozenTodayVolumeStore();
+      return store[String(hub || "__default__")] || null;
+    };
+    const setFrozenTodayVolume = (hub, businessDate, value) => {
+      const store = loadFrozenTodayVolumeStore();
+      store[String(hub || "__default__")] = { businessDate, value: Number(value) || 0, frozenAt: new Date().toISOString() };
+      saveFrozenTodayVolumeStore(store);
+    };
+
     // Migrate the old 00:00 / 12:00 defaults to the new 03:00 / 14:00 defaults.
     // Only values that exactly match the previous defaults are migrated.
     try {
@@ -3880,6 +3904,11 @@ NOL3.pages.planning = function (root) {
         if (i >= 0) return i;
       }
       if (wantsPickedUp) {
+        // Some LM exports use "Delivering Time" as the actual dispatch column.
+        // Match it explicitly and first, with a negative check so it can never
+        // accidentally match "Delivered Time" or "OnHold Time".
+        const deliveringMatch = normalized.findIndex(h => /\bdelivering\b/.test(h) && !/\bdelivered\b/.test(h) && !/\bonhold\b/.test(h));
+        if (deliveringMatch >= 0) return deliveringMatch;
         const i = normalized.findIndex(h => /(picked up|pickup|dispatched|dispatch)/.test(h) && /(date|time|at|timestamp|on)?/.test(h));
         if (i >= 0) return i;
       }
@@ -3887,7 +3916,7 @@ NOL3.pages.planning = function (root) {
     };
     const businessTimestampCandidates = {
       received: ["Current Station Received Time","Current Station Received At","Current Station Received Timestamp","Received At","ReceivedAt","Received Timestamp","Received Time","Receive Time","Received Date","Received Date Time","Received On","Inbound Time","Inbound At","Received","Receive Date"],
-      pickedUp: ["pickedUpAt","Picked Up At","Picked Up Time","Picked Up Timestamp","Pickup Time","Pickup At","Dispatched At","Dispatch Time","Dispatch Timestamp","Picked Up Date Time","Picked Up","Pickup","Dispatched","Dispatch"]
+      pickedUp: ["Delivering Time","pickedUpAt","Picked Up At","Picked Up Time","Picked Up Timestamp","Pickup Time","Pickup At","Dispatched At","Dispatch Time","Dispatch Timestamp","Picked Up Date Time","Picked Up","Pickup","Dispatched","Dispatch"]
     };
 
     const getBusinessWindow = (_now = new Date(), settings = getHubBusinessDaySettings()) => {
@@ -3936,7 +3965,7 @@ NOL3.pages.planning = function (root) {
         return result;
       }
       const settings = getHubBusinessDaySettings();
-      const { start, end, cot } = getBusinessWindow(new Date(), settings);
+      const { start, end, cot, businessDate } = getBusinessWindow(new Date(), settings);
       const exceptionSet = getPlanningExceptionSet();
       const rowIdentity = (row, index) => {
         const raw = identityIndex >= 0 ? row[identityIndex] : "";
@@ -3957,9 +3986,28 @@ NOL3.pages.planning = function (root) {
         // Pickup is optional. If the LM export has it, calculate dispatched/backlog; otherwise volume still works.
         if (pickedAt && pickedAt.getTime() >= start.getTime() && pickedAt.getTime() < end.getTime()) result.dispatchedIds.add(id);
       });
-      result.todayVolume = result.dueIds.size;
+
+      // Today's Volume freeze-at-COT. `dueIds` above stays live (Planning/On-Floor
+      // still filter by the live due set — unchanged), but the displayed/reported
+      // Today's Volume number is captured once LH COT is reached and reused from
+      // then on for this business date, so a later LM upload can't move it.
+      const liveTodayVolume = result.dueIds.size;
+      const hubForFreeze = getSelectedHub() || "__default__";
+      const frozen = getFrozenTodayVolume(hubForFreeze);
+      let frozenValue = null;
+      if (frozen && frozen.businessDate === businessDate) {
+        frozenValue = Number(frozen.value) || 0;
+      } else if (new Date().getTime() >= cot.getTime()) {
+        frozenValue = liveTodayVolume;
+        setFrozenTodayVolume(hubForFreeze, businessDate, frozenValue);
+      }
+      result.todayVolume = frozenValue !== null ? frozenValue : liveTodayVolume;
+      result.todayVolumeFrozen = frozenValue !== null;
+      result.liveTodayVolume = liveTodayVolume;
+
       result.totalDispatched = result.dispatchedIds.size;
-      result.totalBacklogs = [...result.dueIds].filter(id => !result.dispatchedIds.has(id)).length;
+      // Total Backlogs = frozen Today's Volume minus live Total Dispatched, never negative.
+      result.totalBacklogs = Math.max(0, result.todayVolume - result.totalDispatched);
       result.start = start; result.end = end; result.cot = cot; result.settings = settings;
       return result;
     };
@@ -7800,6 +7848,7 @@ NOL3.pages.riders = function (root) {
         weekEnd,
         businessDate,
         hub,
+        todayVolume: textValue("todayVolumeValue"),
         totalDispatched: textValue("totalDispatchedValue"),
         totalBacklogs: textValue("totalBacklogsValue"),
         planningVolume: textValue("planningTotalVolume"),
@@ -7827,12 +7876,13 @@ NOL3.pages.riders = function (root) {
         ["Week End", weekEnd],
         ["Hub", hub],
         [],
-        ["DATE", "TOTAL DISPATCHED", "TOTAL BACKLOGS", "PLANNING VOLUME", "FLEET PRODUCTIVITY TARGET", "PLANNING EXCEPTIONS", "TOWNS / ORDERS", "PARCEL RECORDS", "RIDER TOTAL", "LAST UPDATED"]
+        ["DATE", "TODAY'S VOLUME", "TOTAL DISPATCHED", "TOTAL BACKLOGS", "PLANNING VOLUME", "FLEET PRODUCTIVITY TARGET", "PLANNING EXCEPTIONS", "TOWNS / ORDERS", "PARCEL RECORDS", "RIDER TOTAL", "LAST UPDATED"]
       ];
 
       weekRows.forEach(row => {
         summaryRows.push([
           row.businessDate,
+          row.todayVolume,
           row.totalDispatched,
           row.totalBacklogs,
           row.planningVolume,
@@ -7936,12 +7986,13 @@ NOL3.pages.riders = function (root) {
         ["Week End", weekEnd],
         ["Hub", hub],
         [],
-        ["DATE", "TOTAL DISPATCHED", "TOTAL BACKLOGS", "PLANNING VOLUME", "FLEET PRODUCTIVITY TARGET", "PLANNING EXCEPTIONS", "TOWNS / ORDERS", "PARCEL RECORDS", "RIDER TOTAL", "LAST UPDATED"]
+        ["DATE", "TODAY'S VOLUME", "TOTAL DISPATCHED", "TOTAL BACKLOGS", "PLANNING VOLUME", "FLEET PRODUCTIVITY TARGET", "PLANNING EXCEPTIONS", "TOWNS / ORDERS", "PARCEL RECORDS", "RIDER TOTAL", "LAST UPDATED"]
       ];
 
       weekRows.forEach(row => {
         summaryRows.push([
           row.businessDate,
+          row.todayVolume,
           row.totalDispatched,
           row.totalBacklogs,
           row.planningVolume,
@@ -8815,6 +8866,7 @@ NOL3.pages.riders = function (root) {
       planningExceptions: exceptionStore,
       zoneOverrides: overrideStore[hub] || {},
       zoneSettings: zoneSettingsStore[hub] || {},
+      frozenTodayVolume: NOL3Storage.get("nol3_frozen_today_volume_v1") || "",
       weeklyDailySummary: NOL3Storage.get(`NOL3_WEEKLY_DAILY_SUMMARY_${hub}`) || ""
     };
   }
@@ -8848,6 +8900,9 @@ NOL3.pages.riders = function (root) {
       }
       if (state.weeklyDailySummary) {
         NOL3Storage.set(`NOL3_WEEKLY_DAILY_SUMMARY_${HUB_NAME}`, String(state.weeklyDailySummary));
+      }
+      if (state.frozenTodayVolume) {
+        NOL3Storage.set("nol3_frozen_today_volume_v1", String(state.frozenTodayVolume));
       }
     } finally {
       applyingRemote = false;
